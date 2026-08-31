@@ -1,0 +1,11 @@
+# ===== Bubble chat — repository hygiene =====
+
+# Runtime data: rooms are generated on the server at runtime
+rooms/
+
+# Local editor settings & personal agent memory (privacy — do NOT publish)
+.workbuddy/
+.vscode/
+
+# Leftover dev/test script, not part of the shipped app
+smoke.mjs

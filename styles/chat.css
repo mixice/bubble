@@ -1,0 +1,100 @@
+:root {
+    --color: #2458ff;
+}
+body {background-image: url(../images/bg.jpg);}
+.logo {width: 100px;position: absolute;left: 0;top: 0;margin: 20px;}
+
+chat {height: 100%;display: flex;position: absolute;right: 0;width: 100%;max-width: 1200px;background-color: white;
+    ::-webkit-scrollbar {width: 3px;}
+    .ico {width: 50px;height: 50px;line-height: 50px;}
+    s {width: 50px;height: 50px;display: inline-block;background-size: 90%;vertical-align: middle;cursor: pointer;}
+    chat-title .ico:hover,
+    chat-tool .ico:hover {background: var(--eee);}
+    .avatar {width: 50px;height: 50px;}
+    pop img {max-height: 90%;max-width: 90%;}
+    aside {word-break: break-all;
+        * {white-space: normal;}
+        img {max-width: 200px;cursor: pointer;min-width: 50px;min-height: 50px;}
+        video {max-width: 300px;}
+    }
+    a[download] {display: inline-flex;align-items: center;background-color: var(--orange);text-decoration: none;border-radius: 5px;padding-right: 15px;max-width: 220px;
+        .ico-file {flex: none;}
+        span {overflow: hidden;text-overflow: ellipsis;white-space: nowrap;}
+        &:hover .ico-file:before {content: '\e74e';}
+    }
+}
+
+chat-title {height: 50px;display: flex;align-items: center;border-bottom-width: 1px;position: relative;z-index: 1;
+    h3 {font-size: 16px;flex: 1;padding: 0 10px;}
+    span {padding: 0 10px;}
+    input {flex: 1;min-width: 0;}
+    x.ico-close {background: var(--red) !important;color: white;display: none;}
+}
+
+chat-cont {flex: 1;min-width: 0;display: flex;flex-direction: column;background-color: white;position: relative;z-index: 1;
+    chat-message {flex: 1;border-bottom-width: 1px;overflow: auto;
+        li {padding: 10px;position: relative;overflow: hidden;
+            cite {display: block;margin-bottom: 5px;
+                b {margin-right: 10px;text-transform: uppercase;}
+                span {color: var(--ccc);}
+            }
+            aside {background-color: var(--f7);border-radius: 0 15px 15px 15px;padding: 10px;display: inline-block;}
+            &.system {
+                aside {background-color: var(--ddd);}
+            }
+            &.mine {
+                cite {text-align: right;}
+                aside {border-radius: 15px 0 15px 15px;float: right;}
+            }
+        }
+    }
+}
+
+chat-tool {height: 50px;position: relative;
+    & > a {float: left;position: relative;
+        input[type="file"]{position: absolute;top: 0;left: 0;width: 100%;height: 100%;opacity: 0;}
+    }
+    chat-tip {position: absolute;bottom: 50px;left: 0;background-color: white;border-width: 1px 0;width: 100%;overflow: auto;padding: 10px;display: none;}
+}
+
+chat-attachments {display: flex;flex-wrap: wrap;gap: 10px;padding: 5px 15px;
+    &[hidden] {display: none;}
+    .att {display: inline-flex;align-items: center;gap: 6px;background: var(--eee);border-radius: 14px;padding: 10px;max-width: 220px;font-size: 13px;
+        .ico {width: 25px;height: 25px;line-height: 25px;flex: none;}
+        span {overflow: hidden;text-overflow: ellipsis;white-space: nowrap;}
+        .att-x {margin-left: 4px;color: var(--red);cursor: pointer;font-weight: bold;flex: none;}
+    }
+}
+chat-control {height: 150px;position: relative;overflow: hidden;
+    aside {height: 100%;padding: 5px 70px 5px 15px;overflow: auto;-webkit-user-modify: read-write;
+        * {-webkit-user-modify: read-only;}
+    }
+    .ico-arrow-enter {margin: 10px;background-color: var(--color);color: white;border-radius: 100%;position: absolute;right: 0;bottom: 0;}
+}
+
+
+.login {position: fixed;top: 0;left: 0;width: 100%;height: 100%;z-index: 3;
+    .login-main {background-color: white;padding: 10px 30px;animation-duration: .5s;position: relative;border-radius: 40px;
+        em {width: 100px;display: block;margin: 20px auto;}
+        .login-form {width: 400px;
+            item {padding: 5px 0;
+                i {width: 60px;position: absolute;}
+                cont {position: relative;display: flex;align-items: center;width: 100%;
+                    input {padding: 0 10px 0 55px;flex: 1;height: 60px;font-size: 16px;border-radius: 100px;}
+                    .btn {width: 100%;margin: 15px 0;font-weight: bold;text-transform: uppercase;height: 60px;font-size: 16px;border-radius: 100px;}
+                    o {line-height: 60px;right: 20px;}
+                }
+            }
+        }
+    }
+}
+
+
+
+@media(max-width:1400px){
+    .logo {display: none;}
+}
+
+@media(max-width:640px){
+
+}
