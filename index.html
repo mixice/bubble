@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="window-target" content="_top">
+<meta name="keywords" content="">
+<meta name="description" content="">
+<meta name="author" content="">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="google" content="notranslate">
+<title>Bubble</title>
+
+<link rel="shortcut icon" href="images/ico.svg">
+<link rel="stylesheet" href="https://ui.gg/lib/uigg.css">
+<link rel="stylesheet" href="styles/chat.css">
+
+<script type="module" src="https://ui.gg/lib/uigg.js"></script>
+<script type="module" src="js/chat.js"></script>
+</head>
+
+<body>
+<load></load>
+<chat hide>
+    <chat-cont>
+        <chat-title><h3></h3><span></span>
+            <a class="ico ico-delete"></a>
+            <a class="ico ico-close"></a>
+        </chat-title>
+        <chat-message></chat-message>
+        <chat-tool>
+            <a class="ico ico-emot-smile"></a>
+            <chat-tip><div uigg="emot"></div></chat-tip>
+            <a class="ico ico-folder-empty"><input type="file"></a>
+        </chat-tool>
+        <chat-attachments hidden></chat-attachments>
+        <chat-control>
+            <aside contenteditable="true"></aside>
+            <a class="ico ico-arrow-enter"></a>
+        </chat-control>
+    </chat-cont>
+</chat>
+<section class="login center">
+    <div class="login-main anime-zoom-in">
+        <div class="login-cont">
+            <em><img src="images/ico.svg"></em>
+            <form class="form login-form" id="gate" autocomplete="off">
+                <item><i class="ico ico-hotel"></i><cont><input id="room" type="text" required placeholder="Number" autocomplete="off"></cont></item>
+                <item><i class="ico ico-password"></i><cont><div class="input"><input id="pass" type="password" required placeholder="Password" autocomplete="off"><o class="password"></o></div></cont></item>
+                <item><i class="ico ico-circular-user"></i><cont><input id="user" type="text" required placeholder="Name" autocomplete="off"></cont></item>
+                <item><cont><button class="btn shadow" id="enter" type="submit">Enter</button></cont></item>
+            </form>
+        </div>
+    </div>
+</section>
+<h1 class="logo"><img src="images/ico.svg"></h1>
+</body>
+</html>
