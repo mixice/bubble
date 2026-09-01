@@ -1,4 +1,20 @@
-const { $, $$ } = Uigg
+let $ , $$
+// Wait for the UIGG framework (a separate ES module from the ui.gg CDN) to be ready
+// before touching $ / $$. Otherwise a module load-order race throws "Uigg is not defined"
+// and leaves the entire chat dead on first paint.
+function whenUigg(cb) {
+    if (window.Uigg && typeof window.Uigg.$ === 'function') { cb(); return }
+    const t = setInterval(() => {
+        if (window.Uigg && typeof window.Uigg.$ === 'function') { clearInterval(t); cb() }
+    }, 20)
+    // Don't hang forever if the CDN is unreachable — surface a clear error instead.
+    setTimeout(() => {
+        if (!window.Uigg) {
+            try { Uigg.alert('UI framework failed to load (ui.gg CDN unreachable).') }
+            catch { alert('UI framework failed to load (ui.gg CDN unreachable).') }
+        }
+    }, 5000)
+}
 
 const enc = (s) => new TextEncoder().encode(s)
 const dec = (u8) => new TextDecoder().decode(u8)
@@ -39,6 +55,9 @@ const sfx = {
     end() { this._play('end.mp3') },
 }
 
+function init() {
+    $ = window.Uigg.$
+    $$ = window.Uigg.$$
 const chatEl = document.querySelector('chat')
 const logoEl = document.querySelector('.logo')
 const copyBtn = $('chat-title .ico-copy')
@@ -48,7 +67,7 @@ const chatControl = $('chat-control aside')
 const sendBtn = $('chat-control .ico-arrow-enter')
 const fileInput = $('chat-tool .ico-folder-empty input')
 const clearBtn = $('chat-title .ico-delete')
-const exitBtn = $('chat-title .ico-close')
+const exitBtn = $('chat-title .ico-arrow-out')
 const attachBox = $('chat-attachments')
 const pendingFiles = []
 // The 24-char woven token (room + secret interleaved) currently in use.
@@ -446,14 +465,18 @@ function sessionDestroyed(title, body) {
     history.replaceState(null, '', location.pathname)
     Uigg.alert((title || '') + (body ? '\n' + body : ''))
 }
-function exitRoom() {
+async function exitRoom() {
     dead = true
     sfx.end()
+    // Tell the server we're leaving so the online count drops immediately instead of
+    // lingering for the full PEER_TIMEOUT heartbeat window (180s). Best-effort: if the
+    // request fails the next sweep still reclaims the room.
+    try { await api({ a: 'leave', room, cid }) } catch {}
+    cid = ''
     if (logoEl) logoEl.removeAttribute('hide')
     chatEl.setAttribute('hide', '')
     key = null
     room = ''
-    cid = ''
     since = 0
     chatMsg.innerHTML = ''
     pendingFiles.length = 0
@@ -533,6 +556,38 @@ fileInput.addEventListener('change', () => {
     pendingFiles.push(f)
     renderAttachments()
 })
+// Paste a screenshot (or any image) from the clipboard as an encrypted attachment.
+// contenteditable would otherwise inline the image as base64 and serializeEditor()
+// silently drops it — so we intercept the paste, pull the image File out, and route
+// it through the same sendFile() pipeline as a picked file.
+chatControl.addEventListener('paste', (e) => {
+    if (!room) return
+    const cd = e.clipboardData || window.clipboardData
+    if (!cd || !cd.items) return
+    let added = false
+    for (const it of cd.items) {
+        if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
+            const f = it.getAsFile()
+            if (!f) continue
+            if (f.size > MAX_FILE) {
+                sys('File size exceeded ' + (MAX_FILE / 1048576) + 'MB, Not sent.')
+                continue
+            }
+            const name = f.name || ('screenshot-' + Date.now() + '.png')
+            pendingFiles.push({
+                name,
+                type: f.type || 'image/png',
+                size: f.size,
+                arrayBuffer: () => f.arrayBuffer(),
+            })
+            added = true
+        }
+    }
+    if (added) {
+        e.preventDefault()
+        renderAttachments()
+    }
+})
 clearBtn.addEventListener('click', async () => {
     if (!room) return
     if (!(await Uigg.confirm('Are you sure you want to clear the chat history?'))) return
@@ -548,6 +603,17 @@ exitBtn.addEventListener('click', async () => {
     if (!room) return
     if (!(await Uigg.confirm('Are you sure you want to leave the room?'))) return
     exitRoom()
+})
+const burnBtn = document.querySelector('.ico-close')
+if (burnBtn) burnBtn.addEventListener('click', async () => {
+    if (!room) return
+    if (!(await Uigg.confirm('Are you sure you want to destroy the entire room? All messages and files will be permanently deleted, and others will be disconnected immediately.'))) return
+    try {
+        await api({ a: 'burn', room, cid })
+        sessionDestroyed('Room destroyed. All data has been permanently cleared.')
+    } catch {
+        Uigg.alert('Destruction failed')
+    }
 })
 
 // ===== UI extras: emot panel / image lightbox / room list =====
@@ -628,3 +694,7 @@ $$('chat-list li').forEach(li => {
         chatNew()
     })
 })
+
+}
+
+whenUigg(init)

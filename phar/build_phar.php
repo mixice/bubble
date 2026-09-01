@@ -11,15 +11,15 @@ $phar->startBuffering();
 
 // Map archive-internal name => source file on disk.
 $map = [
-    'index.html' => 'phar/index.html',
-    'app.php'    => 'phar/app.php',
-    'chat.css'   => 'phar/chat.css',
-    'chat.js'    => 'phar/chat.js',
-    'bg.jpg'     => 'phar/bg.jpg',
-    'ico.svg'    => 'phar/ico.svg',
-    'send.mp3'   => 'phar/send.mp3',
-    'receive.mp3'=> 'phar/receive.mp3',
-    'end.mp3'    => 'phar/end.mp3',
+    'index.html' => 'source/index.html',
+    'app.php'    => 'source/app.php',
+    'chat.css'   => 'source/chat.css',
+    'chat.js'    => 'source/chat.js',
+    'bg.jpg'     => 'source/bg.jpg',
+    'ico.svg'    => 'source/ico.svg',
+    'send.mp3'   => 'source/send.mp3',
+    'receive.mp3'=> 'source/receive.mp3',
+    'end.mp3'    => 'source/end.mp3',
 ];
 foreach ($map as $local => $src) {
     $srcPath = __DIR__ . '/' . $src;
@@ -30,7 +30,12 @@ foreach ($map as $local => $src) {
     $phar->addFile($srcPath, $local);
 }
 
-$stub = file_get_contents(__DIR__ . '/phar/stub.php');
+$stubPath = __DIR__ . '/source/stub.php';
+$stub = file_get_contents($stubPath);
+if ($stub === false) {
+    fwrite(STDERR, "missing stub: $stubPath\n");
+    exit(1);
+}
 // Make sure the stub terminates EXACTLY with __HALT_COMPILER(); and nothing after it.
 $stub = rtrim($stub, "\r\n");
 if (substr($stub, -19) !== '__HALT_COMPILER();') {

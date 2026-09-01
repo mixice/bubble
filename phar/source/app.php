@@ -255,6 +255,7 @@ function transact(string $room, bool $create, ?string $cid, callable $fn): array
 
     if (!$fresh && count($data['peers']) === 0) {
         @unlink($path);
+        @unlink($path . '.lock');
         purge_dir(blob_dir($room));
         @flock($lfp, LOCK_UN);
         fclose($lfp);
@@ -270,6 +271,7 @@ function transact(string $room, bool $create, ?string $cid, callable $fn): array
 
     if ($data === null) {
         @unlink($path);
+        @unlink($path . '.lock');
         purge_dir(blob_dir($room));
         @flock($lfp, LOCK_UN);
         fclose($lfp);
@@ -377,6 +379,7 @@ function sweep_expired(): void
         }
         if (!$alive) {
             @unlink($file);
+            @unlink($file . '.lock');
             purge_dir(preg_replace('/\.json$/', '.files', $file) ?: '');
         }
     }
@@ -480,6 +483,19 @@ switch ($action) {
             'seq'    => $data['seq'],
             'online' => count($data['peers'] ?? []),
         ]);
+
+    case 'leave':
+        // A peer is leaving: drop only this cid from the presence set. We pass cid=null
+        // so transact() does NOT re-stamp us, then remove ourselves in the callback.
+        // If nobody else remains, $data is nulled to purge the room immediately.
+        $cid = (string) ($body['cid'] ?? '');
+        transact($room, false, null, function (array &$data) use ($cid): void {
+            unset($data['peers'][$cid]);
+            if (count($data['peers']) === 0) {
+                $data = null; // last one out — destroy the room now
+            }
+        });
+        out(['ok' => true]);
 
     case 'clear':
         // Wipe messages for the whole room (every online peer sees an empty room on next poll).

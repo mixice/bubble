@@ -1,9 +1,8 @@
-:root {
-    --color: #2458ff;
-}
+:root {--color: #2458ff;}
 body {background-image: url(bg.jpg);}
-.logo {width: 150px;height: 150px;z-index: 20;cursor: pointer;}
-.logo[hide] {display: none;}
+.logo {width: 150px;height: 150px;z-index: 20;cursor: pointer;
+    &:hover {animation: .6s anime-beat-z infinite;}
+}
 
 chat {height: 100%;display: flex;position: absolute;right: 0;width: 100%;max-width: 1200px;background-color: white;
     ::-webkit-scrollbar {width: 3px;}
@@ -29,7 +28,6 @@ chat-title {height: 50px;display: flex;align-items: center;border-bottom-width: 
     h3 {font-size: 16px;flex: 1;padding: 0 10px;}
     span {padding: 0 10px;}
     input {flex: 1;min-width: 0;}
-    x.ico-close {background: var(--red) !important;color: white;display: none;}
 }
 
 chat-cont {flex: 1;min-width: 0;display: flex;flex-direction: column;background-color: white;position: relative;z-index: 1;
@@ -72,13 +70,3 @@ chat-control {height: 150px;position: relative;overflow: hidden;
     }
     .ico-arrow-enter {margin: 10px;background-color: var(--color);color: white;border-radius: 100%;position: absolute;right: 0;bottom: 0;}
 }
-
-
-@media(max-width:640px){
-
-}
-.landing {position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #fff; z-index: 1; text-align: center;}
-.landing[hide] {display: none;}
-.landing h1 {font-size: 28px; margin: 0 0 16px; color: var(--color);}
-.landing p {margin: 6px 0; color: var(--ccc); font-size: 15px;}
-.landing .tip {color: var(--aaa); font-size: 13px;}
