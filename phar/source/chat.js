@@ -695,6 +695,21 @@ $$('chat-list li').forEach(li => {
     })
 })
 
+// Best-effort "I'm leaving" ping when the tab is closed or navigated away. A plain
+// fetch inside exitRoom() is killed by the browser during unload, so the server never
+// learns we left and the room + json.lock linger for the full 180s heartbeat window —
+// or forever, if nobody else ever hits the server. sendBeacon survives unload; a
+// keepalive fetch is the fallback. This is what keeps json.lock from piling up after use.
+function beaconLeave() {
+    if (!room || !cid || dead) return
+    const body = JSON.stringify({ a: 'leave', room, cid })
+    const url = location.pathname
+    if (navigator.sendBeacon && navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))) return
+    try { fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body, keepalive: true }) } catch {}
+}
+window.addEventListener('pagehide', beaconLeave)
+window.addEventListener('beforeunload', beaconLeave)
+
 }
 
 whenUigg(init)

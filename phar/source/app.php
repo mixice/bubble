@@ -226,8 +226,13 @@ function transact(string $room, bool $create, ?string $cid, callable $fn): array
     @flock($lfp, LOCK_EX);
 
     if (!$create && !is_file($path)) {
+        // Room file already gone (left / burned / expired). The fopen('c+') above just
+        // re-created the orphaned .lock on disk, so drop it here — otherwise a straggler
+        // request (a late poll still in flight on tab close, or the peer's next poll right
+        // after a burn) keeps the .lock alive forever and it never gets cleaned up.
         @flock($lfp, LOCK_UN);
         fclose($lfp);
+        @unlink($lockp);
         return [null, null];
     }
 
@@ -566,8 +571,13 @@ switch ($action) {
         exit;
 
     case 'burn':
-        @unlink(room_path($room));
-        purge_dir(blob_dir($room));
+        // Destroy the whole room. Route through transact() so we reuse the SAME
+        // purge path that deletes the room JSON AND its .lock AND the blob dir —
+        // the old standalone unlink left an orphan .lock on disk forever. Passing
+        // cid=null avoids re-stamping a presence entry we're about to erase.
+        transact($room, false, null, function (array &$data): void {
+            $data = null; // unconditional purge regardless of who else is in the room
+        });
         out(['ok' => true]);
 
     default:
