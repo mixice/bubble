@@ -1,8 +1,9 @@
 :root {
     --color: #2458ff;
 }
-body {background-image: url(../images/bg.jpg);}
-.logo {width: 100px;position: absolute;left: 0;top: 0;margin: 20px;}
+body {background-image: url(bg.jpg);}
+.logo {width: 150px;height: 150px;z-index: 20;cursor: pointer;}
+.logo[hide] {display: none;}
 
 chat {height: 100%;display: flex;position: absolute;right: 0;width: 100%;max-width: 1200px;background-color: white;
     ::-webkit-scrollbar {width: 3px;}
@@ -73,28 +74,11 @@ chat-control {height: 150px;position: relative;overflow: hidden;
 }
 
 
-.login {position: fixed;top: 0;left: 0;width: 100%;height: 100%;z-index: 3;
-    .login-main {background-color: white;padding: 10px 30px;animation-duration: .5s;position: relative;border-radius: 40px;
-        em {width: 100px;display: block;margin: 20px auto;}
-        .login-form {width: 400px;
-            item {padding: 5px 0;
-                i {width: 60px;position: absolute;}
-                cont {position: relative;display: flex;align-items: center;width: 100%;
-                    input {padding: 0 10px 0 55px;flex: 1;height: 60px;font-size: 16px;border-radius: 100px;}
-                    .btn {width: 100%;margin: 15px 0;font-weight: bold;text-transform: uppercase;height: 60px;font-size: 16px;border-radius: 100px;}
-                    o {line-height: 60px;right: 20px;}
-                }
-            }
-        }
-    }
-}
-
-
-
-@media(max-width:1400px){
-    .logo {display: none;}
-}
-
 @media(max-width:640px){
 
 }
+.landing {position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #fff; z-index: 1; text-align: center;}
+.landing[hide] {display: none;}
+.landing h1 {font-size: 28px; margin: 0 0 16px; color: var(--color);}
+.landing p {margin: 6px 0; color: var(--ccc); font-size: 15px;}
+.landing .tip {color: var(--aaa); font-size: 13px;}

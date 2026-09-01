@@ -20,7 +20,25 @@ declare(strict_types=1);
  *   5. Nothing is logged.
  */
 
-define('DATA_DIR',      __DIR__ . '/rooms');
+// Resolve a writable real directory for room storage:
+//   - web server runs the .phar directly  -> SCRIPT_FILENAME is the real .phar path
+//   - bundled phar context                -> Phar::running() gives the real path
+//   - fallback                            -> __DIR__ (read-only inside a phar)
+$__bubbleBase = null;
+$__sf = $_SERVER['SCRIPT_FILENAME'] ?? '';
+if (strtolower(substr($__sf, -5)) === '.phar') {
+    $__real = realpath($__sf);
+    if ($__real) {
+        $__bubbleBase = dirname($__real);
+    }
+}
+if ($__bubbleBase === null && class_exists('Phar', false) && \Phar::running()) {
+    $__bubbleBase = dirname(\Phar::running(false));
+}
+if ($__bubbleBase === null) {
+    $__bubbleBase = __DIR__;
+}
+define('DATA_DIR',      $__bubbleBase . '/rooms');
 define('PEER_TIMEOUT',  180);       // seconds without a heartbeat before a peer is considered gone
 // Per-room ring buffer of message references. Attachments no longer live in the room
 // file — only a small reference per file — so this caps chat turns, not raw bytes.

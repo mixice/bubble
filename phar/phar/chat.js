@@ -29,7 +29,7 @@ let loadingLi = null
 const sfx = {
     _play(f) {
         try {
-            const a = new Audio('styles/' + f)
+            const a = new Audio(f)
             a.volume = 0.5
             a.play().catch(() => {})
         } catch {}
@@ -39,23 +39,84 @@ const sfx = {
     end() { this._play('end.mp3') },
 }
 
-const loginSection = document.querySelector('section.login')
 const chatEl = document.querySelector('chat')
-const gateForm = $('#gate')
-const roomInput = $('#room')
-const passInput = $('#pass')
-const enterBtn = $('#enter')
+const logoEl = document.querySelector('.logo')
+const copyBtn = $('chat-title .ico-copy')
 const chatMsg = $('chat-message')
 const chatTitle = $('chat-title h3')
-const chatOnline = $('chat-title span')
 const chatControl = $('chat-control aside')
 const sendBtn = $('chat-control .ico-arrow-enter')
 const fileInput = $('chat-tool .ico-folder-empty input')
 const clearBtn = $('chat-title .ico-delete')
 const exitBtn = $('chat-title .ico-close')
-const userInput = $('#user')
 const attachBox = $('chat-attachments')
 const pendingFiles = []
+// The 24-char woven token (room + secret interleaved) currently in use.
+let currentToken = ''
+
+// ---- stable device identity (persisted in localStorage) ----
+// System-assigned nickname: one uppercase letter + three digits, e.g. A123.
+// Persisted locally so the same device keeps one handle across all rooms.
+const CFG_KEY = 'bubble:config'
+const NICK_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+function genRandomNick() {
+    const L = NICK_LETTERS[crypto.getRandomValues(new Uint8Array(1))[0] % 26]
+    const num = String(crypto.getRandomValues(new Uint8Array(2))[0] % 1000).padStart(3, '0')
+    return L + num
+}
+function loadConfig() {
+    try { return JSON.parse(localStorage.getItem(CFG_KEY) || '{}') } catch { return {} }
+}
+function saveConfig(cfg) {
+    try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)) } catch {}
+}
+function getDeviceNick() {
+    const cfg = loadConfig()
+    if (cfg.name) return cfg.name
+    cfg.name = genRandomNick()
+    saveConfig(cfg)
+    return cfg.name
+}
+// ---- woven token: room(12) + secret(12) interleaved into 24 chars ----
+// Layout: room[0:4] secret[0:4] room[4:8] secret[4:8] room[8:12] secret[8:12]
+// The token lives ONLY in the URL fragment (#), never sent to the server, never
+// logged. Sharing the link = sharing the key; that is by design, not a leak.
+const TOKEN_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+function randStr(n) {
+    const out = new Array(n)
+    const buf = crypto.getRandomValues(new Uint8Array(n))
+    for (let i = 0; i < n; i++) out[i] = TOKEN_CHARS[buf[i] % 62]
+    return out.join('')
+}
+function makeToken() {
+    const room = randStr(12)
+    const secret = randStr(12)
+    let t = ''
+    for (let i = 0; i < 3; i++) t += room.slice(i * 4, i * 4 + 4) + secret.slice(i * 4, i * 4 + 4)
+    return { room, secret, token: t }
+}
+function parseToken(tok) {
+    if (!tok || tok.length !== 24) return null
+    if (!/^[A-Za-z0-9]{24}$/.test(tok)) return null
+    const room = tok.slice(0, 4) + tok.slice(8, 12) + tok.slice(16, 20)
+    const secret = tok.slice(4, 8) + tok.slice(12, 16) + tok.slice(20, 24)
+    return { room, secret }
+}
+function shareUrl(tok) {
+    return location.origin + location.pathname + '#' + tok
+}
+// One-tap copy of the full invite link. Room + key both live in the # fragment,
+// so the link is self-contained and the server never sees either.
+if (copyBtn) copyBtn.addEventListener('click', async () => {
+    if (!currentToken) return
+    const url = shareUrl(currentToken)
+    try {
+        await navigator.clipboard.writeText(url)
+        Uigg.alert('Invitation link copied')
+    } catch {
+        Uigg.alert('Copy failed: ' + url)
+    }
+})
 
 function fatal(msg) {
     Uigg.alert(msg)
@@ -99,7 +160,7 @@ async function api(body) {
     const timer = setTimeout(() => ctrl.abort(), 20000)
     let r
     try {
-        r = await fetch('api.php', {
+        r = await fetch(location.pathname, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify(body),
@@ -107,7 +168,7 @@ async function api(body) {
         })
     } catch (e) {
         clearTimeout(timer)
-        if (e.name === 'AbortError') throw new Error('request timed out (20s) — 多半被防火墙/WAF 拦截，或服务端无响应')
+        if (e.name === 'AbortError') throw new Error('request timed out (20s) — possibly blocked by firewall/WAF or server unresponsive')
         throw e
     }
     clearTimeout(timer)
@@ -121,7 +182,7 @@ async function apiRaw(query, bytes) {
     const timer = setTimeout(() => ctrl.abort(), 60000)
     let r
     try {
-        r = await fetch('api.php?' + new URLSearchParams(query).toString(), {
+        r = await fetch(location.pathname + '?' + new URLSearchParams(query).toString(), {
             method: 'POST',
             headers: { 'content-type': 'application/octet-stream' },
             body: bytes || new Uint8Array(0),
@@ -252,8 +313,7 @@ async function loop() {
             const r = await api({ a: 'poll', room, since, cid, limit: POLL_PAGE })
             if (r.gone) { sys('Room closed (idle for too long). Please re-enter'); dead = true; sfx.end(); return }
             if (typeof r.online === 'number') {
-                chatTitle.textContent = '#' + room
-                chatOnline.textContent = r.online + ' online'
+                chatTitle.textContent = r.online + ' online'
             }
             if (typeof r.seq === 'number' && r.seq < since) {
                 chatMsg.innerHTML = ''
@@ -378,16 +438,18 @@ async function sendFile(f) {
 function sessionDestroyed(title, body) {
     dead = true
     sfx.end()
-    loginSection.removeAttribute('hide')
+    if (logoEl) logoEl.removeAttribute('hide')
     chatEl.setAttribute('hide', '')
     chatMsg.innerHTML = ''
     seenMid.clear()
+    currentToken = ''
+    history.replaceState(null, '', location.pathname)
     Uigg.alert((title || '') + (body ? '\n' + body : ''))
 }
 function exitRoom() {
     dead = true
     sfx.end()
-    loginSection.removeAttribute('hide')
+    if (logoEl) logoEl.removeAttribute('hide')
     chatEl.setAttribute('hide', '')
     key = null
     room = ''
@@ -397,23 +459,27 @@ function exitRoom() {
     pendingFiles.length = 0
     renderAttachments()
     seenMid.clear()
-    roomInput.value = ''
-    passInput.value = ''
-    enterBtn.disabled = false
-    enterBtn.textContent = 'Enter'
-    chatTitle.textContent = 'name'
+    currentToken = ''
+    chatTitle.textContent = ''
+    // drop the #token so a refresh won't silently re-enter the room
+    history.replaceState(null, '', location.pathname)
 }
-gateForm.addEventListener('submit', async (e) => {
-    e.preventDefault()
-    room = roomInput.value.trim()
-    const pass = passInput.value
-    displayName = (userInput.value || '').trim()
-    if (!room || !pass || !displayName) return
-    enterBtn.disabled = true
-    enterBtn.textContent = 'Derived key…'
+async function startChat() {
+    if (logoEl) logoEl.setAttribute('hide', '')
+    chatEl.removeAttribute('hide')
+    loadingLi = sys('Loading history…')
+    warm = true
+    loop()
+}
+async function enterWithToken(tok) {
+    const parsed = parseToken(tok)
+    if (!parsed) { Uigg.alert('Invalid invite code: must be a 24-character alphanumeric token'); return false }
+    currentToken = tok
+    room = parsed.room
+    displayName = getDeviceNick()
     try {
         dead = false
-        key = await deriveKey(pass, room)
+        key = await deriveKey(parsed.secret, room)
         const storeKey = 'bubble:cid:' + room
         let stored = ''
         try { stored = localStorage.getItem(storeKey) || '' } catch { }
@@ -421,21 +487,34 @@ gateForm.addEventListener('submit', async (e) => {
         if (!stored) { try { localStorage.setItem(storeKey, cid) } catch { } }
         since = 0
         const hello = await api({ a: 'hello', room, cid })
-        chatOnline.textContent = typeof hello.online === 'number' ? hello.online + ' online' : ''
+        chatTitle.textContent = typeof hello.online === 'number' ? hello.online + ' online' : ''
     } catch (err) {
-        enterBtn.disabled = false
-        enterBtn.textContent = 'Enter'
-        sys('Failed to connect to server：' + err.message)
-        return
+        sys('Failed to connect to server: ' + err.message)
+        return false
     }
-    loginSection.setAttribute('hide', '')
-    chatEl.removeAttribute('hide')
-    enterBtn.textContent = 'Enter'
-    chatTitle.textContent = '#' + room
-    loadingLi = sys('Loading history…')
-    warm = true
-    loop()
+    return true
+}
+async function createRoom() {
+    const { token } = makeToken()
+    // reflect the token in the address bar so the link can be copied directly
+    history.replaceState(null, '', '#' + token)
+    const ok = await enterWithToken(token)
+    if (ok) {
+        startChat()
+        const url = shareUrl(token)
+        try { await navigator.clipboard.writeText(url) } catch { }
+        Uigg.alert('Invitation link copied')
+    }
+}
+if (logoEl) logoEl.addEventListener('click', (e) => {
+    e.preventDefault()
+    createRoom()
 })
+// Auto-enter when the page is opened from a shared #token link.
+const initialToken = (location.hash || '').replace(/^#/, '').trim()
+if (initialToken && parseToken(initialToken)) {
+    enterWithToken(initialToken).then((ok) => { if (ok) startChat() })
+}
 sendBtn.addEventListener('click', () => send())
 chatControl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.ctrlKey) { e.preventDefault(); send() }

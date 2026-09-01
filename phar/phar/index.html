@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="window-target" content="_top">
+<meta name="keywords" content="">
+<meta name="description" content="">
+<meta name="author" content="">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="google" content="notranslate">
+<title>Bubble</title>
+
+<link rel="shortcut icon" href="ico.svg">
+<link rel="stylesheet" href="https://ui.gg/lib/uigg.css">
+<link rel="stylesheet" href="chat.css">
+
+<script type="module" src="https://ui.gg/lib/uigg.js"></script>
+<script type="module" src="chat.js"></script>
+</head>
+
+<body>
+<load></load>
+<chat hide>
+    <chat-cont>
+        <chat-title><h3></h3>
+            <a class="ico ico-copy"></a>
+            <a class="ico ico-delete"></a>
+            <a class="ico ico-close"></a>
+        </chat-title>
+        <chat-message></chat-message>
+        <chat-tool>
+            <a class="ico ico-emot-smile"></a>
+            <chat-tip><div uigg="emot"></div></chat-tip>
+            <a class="ico ico-folder-empty"><input type="file"></a>
+        </chat-tool>
+        <chat-attachments hidden></chat-attachments>
+        <chat-control>
+            <aside contenteditable="true"></aside>
+            <a class="ico ico-arrow-enter"></a>
+        </chat-control>
+    </chat-cont>
+</chat>
+<a class="absolute-5 logo"><img src="ico.svg"></a>
+</body>
+</html>
