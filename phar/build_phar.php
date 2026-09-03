@@ -15,11 +15,11 @@ $map = [
     'app.php'    => 'source/app.php',
     'chat.css'   => 'source/chat.css',
     'chat.js'    => 'source/chat.js',
-    'bg.jpg'     => 'source/bg.jpg',
     'ico.svg'    => 'source/ico.svg',
     'send.mp3'   => 'source/send.mp3',
     'receive.mp3'=> 'source/receive.mp3',
     'end.mp3'    => 'source/end.mp3',
+    'delete.mp3' => 'source/delete.mp3',
 ];
 foreach ($map as $local => $src) {
     $srcPath = __DIR__ . '/' . $src;

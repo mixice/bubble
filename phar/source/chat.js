@@ -53,6 +53,7 @@ const sfx = {
     send() { this._play('send.mp3') },
     recv() { this._play('receive.mp3') },
     end() { this._play('end.mp3') },
+    del() { this._play('delete.mp3') },
 }
 
 function init() {
@@ -533,11 +534,40 @@ if (logoEl) logoEl.addEventListener('click', (e) => {
     e.preventDefault()
     createRoom()
 })
-// Auto-enter when the page is opened from a shared #token link.
-const initialToken = (location.hash || '').replace(/^#/, '').trim()
-if (initialToken && parseToken(initialToken)) {
-    enterWithToken(initialToken).then((ok) => { if (ok) startChat() })
+// Enter (or switch to) a room from the #token in the URL. Runs both on first
+// paint and when the user pastes a room link into an already-open tab. In the
+// latter case the browser only changes the hash and does NOT reload, so we also
+// listen for hashchange. createRoom/exitRoom call history.replaceState, which
+// never fires hashchange, so this can't loop with those paths.
+async function handleHashChange() {
+    const tok = (location.hash || '').replace(/^#/, '').trim()
+    if (!tok || !parseToken(tok)) {
+        // Hash cleared while we're in a room -> leave it.
+        if (!tok && room) exitRoom()
+        return
+    }
+    if (tok === currentToken) return
+    if (room) {
+        // Switch rooms: drop the current session quietly. Don't touch the URL
+        // (the pasted #token stays put) and don't play the end sound.
+        dead = true
+        try { await api({ a: 'leave', room, cid }) } catch {}
+        cid = ''
+        key = null
+        room = ''
+        since = 0
+        chatMsg.innerHTML = ''
+        pendingFiles.length = 0
+        renderAttachments()
+        seenMid.clear()
+        currentToken = ''
+        chatTitle.textContent = ''
+    }
+    const ok = await enterWithToken(tok)
+    if (ok) startChat()
 }
+handleHashChange()
+window.addEventListener('hashchange', handleHashChange)
 sendBtn.addEventListener('click', () => send())
 chatControl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.ctrlKey) { e.preventDefault(); send() }
@@ -594,6 +624,7 @@ clearBtn.addEventListener('click', async () => {
     try {
         await api({ a: 'clear', room, cid })
         chatMsg.innerHTML = ''
+        sfx.del()
         sys('Chat history cleared')
     } catch {
         sys('Clear failed')
