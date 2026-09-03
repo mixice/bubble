@@ -5,6 +5,10 @@
 // client unencrypted; see app.php for the server-side contract.
 Phar::mapPhar('bubble.phar');
 
+// Discourage search engines / crawlers from indexing this private chat instance.
+// Sent on every response leaving this front controller (HTML, assets, API, 404).
+header('X-Robots-Tag: noindex, nofollow');
+
 // All bundled assets are served through the phar://bubble.phar stream. The alias is
 // registered by Phar::mapPhar('bubble.phar') above, so this works whether the .phar is
 // executed directly (web entry point) or merely included by a dev router.
@@ -35,6 +39,16 @@ $STATIC = [
 // Every POST is an API call — chat.js always posts to location.pathname.
 if ($method === 'POST') {
     require $root . '/app.php';
+    exit;
+}
+
+// Serve /robots.txt from the phar itself so well-behaved crawlers are told not to
+// index anything. Handled here so it works regardless of how the web server routes
+// requests (the phar is the only entry point; a missing physical file would otherwise
+// fall through to the index.html shell).
+if ($rel === 'robots.txt') {
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "User-agent: *\nDisallow: /\n";
     exit;
 }
 
