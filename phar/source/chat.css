@@ -1,7 +1,8 @@
 :root {--color: #2458ff;}
+body {background-color: black;}
 body::before {position: fixed;top: 0;left: 0;width: 100%;height: 100%;content: '';backdrop-filter: blur(10px);}
-.logo {width: 150px;height: 150px;z-index: 20;cursor: pointer;
-    &:hover {animation: .6s anime-beat-z infinite;}
+.logo {width: 150px;height: 150px;z-index: 20;cursor: pointer;mix-blend-mode: luminosity;animation-delay: 1s;
+    &:hover img {animation: .6s anime-beat-z infinite;}
 }
 .btn {border-radius: 100px;}
 

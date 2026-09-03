@@ -40,6 +40,7 @@ if ($__bubbleBase === null) {
 }
 define('DATA_DIR',      $__bubbleBase . '/rooms');
 define('PEER_TIMEOUT',  180);       // seconds without a heartbeat before a peer is considered gone
+define('BURNED_TTL',    30);        // burn tombstones auto-delete ~30s after write so rooms can be reused quickly
 define('PEER_TOUCH_INTERVAL', 20);  // do not rewrite the room file for every poll
 // Per-room ring buffer of message references. Attachments no longer live in the room
 // file — only a small reference per file — so this caps chat turns, not raw bytes.
@@ -117,6 +118,34 @@ function blob_path(string $room, string $fid): string
 function burned_path(string $room): string
 {
     return DATA_DIR . '/' . hash('sha256', $room) . '.burned';
+}
+
+function burned_time(string $path, int $fallback): int
+{
+    $raw = @file_get_contents($path);
+    $stamp = $raw === false ? 0 : (int) trim($raw);
+    if ($stamp > 0) {
+        return $stamp;
+    }
+    $mtime = @filemtime($path);
+    return $mtime === false ? $fallback : (int) $mtime;
+}
+
+function sweep_burned(): void
+{
+    if (!is_dir(DATA_DIR)) {
+        return;
+    }
+    $now = time();
+    foreach (glob(DATA_DIR . '/*.burned') ?: [] as $file) {
+        if (!is_file($file)) {
+            continue;
+        }
+        $stamp = burned_time($file, $now);
+        if ($now - $stamp > BURNED_TTL) {
+            @unlink($file);
+        }
+    }
 }
 
 function valid_cid(string $cid): bool
@@ -282,26 +311,31 @@ function transact(string $room, bool $create, ?string $cid, callable $fn, bool $
     }
     @flock($lfp, LOCK_EX);
 
-    if ($create && is_file(burned_path($room))) {
-        @flock($lfp, LOCK_UN);
-        fclose($lfp);
-        @unlink($lockp);
-        return [null, ['burned' => true]];
+    $now = time();
+    $burnedPath = burned_path($room);
+    if ($create && is_file($burnedPath)) {
+        if ($now - burned_time($burnedPath, $now) > BURNED_TTL) {
+            @unlink($burnedPath);
+        } else {
+            @flock($lfp, LOCK_UN);
+            fclose($lfp);
+            @unlink($lockp);
+            return [null, ['burned' => true]];
+        }
     }
 
     if (!$create && !is_file($path)) {
-        // Room file already gone (left / burned / expired). Keep the lock file in place:
-        // unlinking it after releasing the handle would race a simultaneous create request.
-        // It is tiny and can safely be reused by a later request.
+        // Room file already gone (left / burned / expired). Close before unlinking so
+        // the lock does not survive a late poll after the room was destroyed.
         @flock($lfp, LOCK_UN);
         fclose($lfp);
+        @unlink($lockp);
         return [null, null];
     }
 
     $raw  = is_file($path) ? @file_get_contents($path) : '';
     $data = ($raw === false || $raw === '') ? null : json_decode($raw, true);
 
-    $now = time();
     $fresh = !is_array($data) || !isset($data['created'], $data['seq'], $data['msgs']);
     if ($fresh) {
         $data = ['created' => $now, 'seq' => 0, 'msgs' => [], 'peers' => [], 'uploads' => [], 'blobs' => []];
@@ -346,6 +380,7 @@ function transact(string $room, bool $create, ?string $cid, callable $fn, bool $
         purge_dir(blob_dir($room));
         @flock($lfp, LOCK_UN);
         fclose($lfp);
+        @unlink($lockp);
         return [null, null];
     }
 
@@ -366,6 +401,7 @@ function transact(string $room, bool $create, ?string $cid, callable $fn, bool $
         purge_dir(blob_dir($room));
         @flock($lfp, LOCK_UN);
         fclose($lfp);
+        @unlink($lockp);
         return [null, $result];
     }
 
@@ -443,6 +479,7 @@ function sweep_expired(): void
     @file_put_contents($stamp, (string) $now, LOCK_EX);
 
     sweep_blobs();
+    sweep_burned();
 
     $glob = glob(DATA_DIR . '/*.json');
     foreach ($glob === false ? [] : $glob as $file) {
