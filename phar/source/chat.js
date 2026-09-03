@@ -18,7 +18,9 @@ function whenUigg(cb) {
 
 const enc = (s) => new TextEncoder().encode(s)
 const dec = (u8) => new TextDecoder().decode(u8)
-const MAX_FILE = 50 * 1024 * 1024  // client-side UX guard; attachments stream to a blob, never into the room file
+const MAX_FILE = 48 * 1024 * 1024  // leave room for per-chunk AES-GCM framing and metadata
+const MAX_TEXT = 96 * 1024
+const FILE_MAGIC = new Uint8Array([0x42, 0x46, 0x31, 0x01])
 const POLL_PAGE = 40
 const POLL_IDLE = 3000
 const POLL_BUSY = 1200
@@ -71,6 +73,7 @@ const clearBtn = $('chat-title .ico-delete')
 const exitBtn = $('chat-title .ico-arrow-out')
 const attachBox = $('chat-attachments')
 const pendingFiles = []
+const objectUrls = new Set()
 // The 24-char woven token (room + secret interleaved) currently in use.
 let currentToken = ''
 
@@ -173,7 +176,76 @@ async function seal(bytes) {
     return out
 }
 async function unseal(packed) {
+    if (packed.byteLength < 28) throw new Error('invalid ciphertext')
     return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: packed.subarray(0, 12) }, key, packed.subarray(12)))
+}
+async function sealChunk(bytes) {
+    return seal(bytes)
+}
+async function decryptFileResponse(response) {
+    if (!response.body) return { packed: new Uint8Array(await response.arrayBuffer()) }
+    const reader = response.body.getReader()
+    let pending = new Uint8Array(0)
+    let ended = false
+    const append = (chunk) => {
+        if (!chunk || chunk.length === 0) return
+        const next = new Uint8Array(pending.length + chunk.length)
+        next.set(pending)
+        next.set(chunk, pending.length)
+        pending = next
+    }
+    const fill = async (need) => {
+        while (!ended && pending.length < need) {
+            const part = await reader.read()
+            if (part.done) ended = true
+            else append(part.value)
+        }
+        return pending.length >= need
+    }
+    const take = async (count) => {
+        if (!(await fill(count))) throw new Error('truncated file')
+        const out = pending.subarray(0, count)
+        pending = pending.subarray(count)
+        return out
+    }
+    const head = await take(FILE_MAGIC.length)
+    if (!head.every((v, i) => v === FILE_MAGIC[i])) {
+        // Legacy attachment: the whole response is one AES-GCM record. Preserve
+        // compatibility by buffering only this old format.
+        const rest = []
+        if (head.length) rest.push(head)
+        if (pending.length) { rest.push(pending); pending = new Uint8Array(0) }
+        while (!ended) {
+            const part = await reader.read()
+            if (part.done) { ended = true; break }
+            rest.push(part.value)
+        }
+        const total = rest.reduce((n, b) => n + b.length, 0)
+        const packed = new Uint8Array(total)
+        let at = 0
+        for (const b of rest) { packed.set(b, at); at += b.length }
+        return { packed }
+    }
+    let meta = null
+    const parts = []
+    while (true) {
+        if (!(await fill(4))) break
+        const frameHead = await take(4)
+        const frameLen = new DataView(frameHead.buffer, frameHead.byteOffset, 4).getUint32(0)
+        if (frameLen < 28 || frameLen > 1024 * 1024) throw new Error('invalid file frame')
+        const plain = await unseal(await take(frameLen))
+        if (meta === null) {
+            if (plain.length < 4) throw new Error('invalid file metadata')
+            const metaLen = new DataView(plain.buffer, plain.byteOffset, plain.byteLength).getUint32(0)
+            if (metaLen <= 0 || metaLen > plain.length - 4) throw new Error('invalid file metadata')
+            meta = JSON.parse(dec(plain.subarray(4, 4 + metaLen)))
+            parts.push(plain.subarray(4 + metaLen))
+        } else {
+            parts.push(plain)
+        }
+    }
+    if (meta === null) throw new Error('empty file')
+    return { meta, blob: new Blob(parts, { type: meta.type || 'application/octet-stream' }) }
 }
 async function api(body) {
     const ctrl = new AbortController()
@@ -258,10 +330,16 @@ function abbrName(n) {
     return n.slice(0, 10) + '…' + ext
 }
 async function renderFile(aside, packed) {
+    if (packed.byteLength < 4) throw new Error('invalid file metadata')
     const metaLen = new DataView(packed.buffer, packed.byteOffset, packed.byteLength).getUint32(0)
+    if (metaLen <= 0 || metaLen > packed.byteLength - 4) throw new Error('invalid file metadata')
     const meta = JSON.parse(dec(packed.subarray(4, 4 + metaLen)))
     const blob = new Blob([packed.subarray(4 + metaLen)], { type: meta.type || 'application/octet-stream' })
+    return renderBlob(aside, meta, blob)
+}
+function renderBlob(aside, meta, blob) {
     const url = URL.createObjectURL(blob)
+    objectUrls.add(url)
     aside.textContent = ''
     const type = meta.type || ''
     if (type.startsWith('image/')) {
@@ -299,6 +377,10 @@ async function renderFile(aside, packed) {
     }
     scroll()
 }
+function revokeObjectUrls() {
+    for (const url of objectUrls) URL.revokeObjectURL(url)
+    objectUrls.clear()
+}
 async function deliver(msg) {
     let env
     try {
@@ -319,8 +401,10 @@ async function deliver(msg) {
         const aside = bubble(env.cid === cid, env.name)
         aside.textContent = 'Downloading…'
         try {
-            const r = await apiRaw({ a: 'fetch', room, fid: env.fid })
-            await renderFile(aside, await unseal(new Uint8Array(await r.arrayBuffer())))
+            const r = await apiRaw({ a: 'fetch', room, fid: env.fid, cid })
+            const decoded = await decryptFileResponse(r)
+            if (decoded.packed) await renderFile(aside, await unseal(decoded.packed))
+            else await renderBlob(aside, decoded.meta, decoded.blob)
             if (!warm && env.cid !== cid) sfx.recv()
         } catch {
             aside.textContent = 'File download failed'
@@ -331,12 +415,16 @@ async function loop() {
     while (!dead) {
         try {
             const r = await api({ a: 'poll', room, since, cid, limit: POLL_PAGE })
-            if (r.gone) { sys('Room closed (idle for too long). Please re-enter'); dead = true; sfx.end(); return }
+            if (r.gone) {
+                sessionDestroyed('Room closed', 'This room is no longer available.')
+                return
+            }
             if (typeof r.online === 'number') {
                 chatTitle.textContent = r.online + ' online'
             }
             if (typeof r.seq === 'number' && r.seq < since) {
                 chatMsg.innerHTML = ''
+                revokeObjectUrls()
                 since = 0
                 sys('Chat history has been cleared')
             }
@@ -362,7 +450,7 @@ async function loop() {
 }
 async function post(env) {
     const payload = bytesToB64(await seal(enc(JSON.stringify(Object.assign({ cid, name: displayName }, env)))))
-    const r = await api({ a: 'post', room, payload, cid })
+    const r = await api({ a: 'post', room, payload, cid, mid: env.mid })
     since = Math.max(since, r.i)
     return r
 }
@@ -401,6 +489,10 @@ function renderText(aside, text) {
 async function send() {
     if (dead) return
     const text = serializeEditor().trim()
+    if (enc(text).length > MAX_TEXT) {
+        sys('Message is too long (maximum ' + Math.round(MAX_TEXT / 1024) + 'KB)')
+        return
+    }
     const files = pendingFiles.slice()
     if (!text && files.length === 0) return
     sfx.send()
@@ -412,7 +504,7 @@ async function send() {
         markSent(mid)
         const aside = bubble(true, displayName)
         renderText(aside, text)
-        try { await post({ k: 'text', v: text, mid }) } catch { aside.textContent = text + '(Send failed)' }
+        try { await post({ k: 'text', v: text, mid }) } catch { sys('Delivery status unknown; the server may still have received the message') }
     }
     for (const f of files) await sendFile(f)
 }
@@ -431,28 +523,55 @@ async function sendFile(f) {
     aside.textContent = 'Encrypting…'
     try {
         const meta = enc(JSON.stringify({ name: f.name, type: f.type, size: f.size }))
-        const body = new Uint8Array(await f.arrayBuffer())
-        const packed = new Uint8Array(4 + meta.length + body.length)
-        new DataView(packed.buffer).setUint32(0, meta.length)
-        packed.set(meta, 4)
-        packed.set(body, 4 + meta.length)
-        // Encrypt once, then stream the raw ciphertext bytes into a server-side blob.
-        // No base64 inflation, and not a single byte lands in the room file.
-        const blob = await seal(packed)
-        const begin = await api({ a: 'fbegin', room, fid, cid })
-        const chunk = (begin.chunk | 0) || 512 * 1024
-        const total = Math.ceil(blob.length / chunk) || 1
-        for (let i = 0; i < total; i++) {
-            aside.textContent = 'Uploading ' + (i + 1) + '/' + total
-            await apiRaw({ a: 'fpart', room, fid, seq: i }, blob.subarray(i * chunk, (i + 1) * chunk))
+        const firstPrefix = new Uint8Array(4 + meta.length)
+        new DataView(firstPrefix.buffer).setUint32(0, meta.length)
+        firstPrefix.set(meta, 4)
+        const probe = await api({ a: 'fbegin', room, cid, probe: '1', size: 0 })
+        // Leave headroom for the frame length, magic prefix, PHP request parsing,
+        // and any proxy-added request overhead.
+        const plainChunk = Math.max(16 * 1024, Math.min(512 * 1024, (probe.chunk | 0) - 8192 - 36))
+        const totalPlain = firstPrefix.length + f.size
+        const chunks = Math.ceil(totalPlain / plainChunk) || 1
+        const encryptedSize = FILE_MAGIC.length + Array.from({ length: chunks }, (_, i) => {
+            const plainLen = Math.min(plainChunk, totalPlain - i * plainChunk)
+            return 4 + 12 + plainLen + 16
+        }).reduce((a, b) => a + b, 0)
+        await api({ a: 'fbegin', room, fid, cid, size: encryptedSize })
+        // Encrypt each plaintext chunk independently. Each raw upload frame is
+        // [uint32 ciphertext length][12-byte IV + ciphertext + 16-byte tag].
+        let plainOffset = 0
+        for (let i = 0; i < chunks; i++) {
+            const plainLen = Math.min(plainChunk, totalPlain - plainOffset)
+            const plain = new Uint8Array(plainLen)
+            let at = 0
+            if (plainOffset < firstPrefix.length) {
+                const n = Math.min(firstPrefix.length - plainOffset, plainLen)
+                plain.set(firstPrefix.subarray(plainOffset, plainOffset + n), at)
+                at += n
+                plainOffset += n
+            }
+            if (at < plainLen) {
+                const fileOffset = Math.max(0, plainOffset - firstPrefix.length)
+                plain.set(new Uint8Array(await f.slice(fileOffset, fileOffset + plainLen - at).arrayBuffer()), at)
+                plainOffset += plainLen - at
+            }
+            const encrypted = await sealChunk(plain)
+            const frame = new Uint8Array(4 + encrypted.length)
+            new DataView(frame.buffer).setUint32(0, encrypted.length)
+            frame.set(encrypted, 4)
+            aside.textContent = 'Uploading ' + (i + 1) + '/' + chunks
+            const upload = i === 0 ? new Uint8Array(FILE_MAGIC.length + frame.length) : frame
+            if (i === 0) { upload.set(FILE_MAGIC); upload.set(frame, FILE_MAGIC.length) }
+            await apiRaw({ a: 'fpart', room, fid, cid, seq: i }, upload)
         }
+        await api({ a: 'fcommit', room, fid, cid })
         // Announce only after the bytes are stored, so receivers never pull a partial blob.
-        await post({ k: 'fmeta', fid, size: blob.length, mid })
-        await renderFile(aside, packed)
+        await post({ k: 'fmeta', fid, size: encryptedSize, mid })
+        // Render locally from the original file without another encryption/decryption pass.
+        await renderBlob(aside, { name: f.name, type: f.type }, f)
     } catch (e) {
         console.error('[chat] sendFile failed:', e)
-        const m = e && e.message && e.message.match(/http (\d+)/)
-        aside.textContent = 'Send failed' + (m ? ' (http ' + m[1] + ')' : '')
+        aside.textContent = 'Delivery status unknown'
     }
 }
 function sessionDestroyed(title, body) {
@@ -461,6 +580,7 @@ function sessionDestroyed(title, body) {
     if (logoEl) logoEl.removeAttribute('hide')
     chatEl.setAttribute('hide', '')
     chatMsg.innerHTML = ''
+    revokeObjectUrls()
     seenMid.clear()
     currentToken = ''
     history.replaceState(null, '', location.pathname)
@@ -480,6 +600,7 @@ async function exitRoom() {
     room = ''
     since = 0
     chatMsg.innerHTML = ''
+    revokeObjectUrls()
     pendingFiles.length = 0
     renderAttachments()
     seenMid.clear()
@@ -557,6 +678,7 @@ async function handleHashChange() {
         room = ''
         since = 0
         chatMsg.innerHTML = ''
+        revokeObjectUrls()
         pendingFiles.length = 0
         renderAttachments()
         seenMid.clear()
@@ -604,12 +726,7 @@ chatControl.addEventListener('paste', (e) => {
                 continue
             }
             const name = f.name || ('screenshot-' + Date.now() + '.png')
-            pendingFiles.push({
-                name,
-                type: f.type || 'image/png',
-                size: f.size,
-                arrayBuffer: () => f.arrayBuffer(),
-            })
+            pendingFiles.push(new File([f], name, { type: f.type || 'image/png' }))
             added = true
         }
     }
@@ -624,6 +741,7 @@ clearBtn.addEventListener('click', async () => {
     try {
         await api({ a: 'clear', room, cid })
         chatMsg.innerHTML = ''
+        revokeObjectUrls()
         sfx.del()
         sys('Chat history cleared')
     } catch {

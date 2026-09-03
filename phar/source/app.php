@@ -40,20 +40,27 @@ if ($__bubbleBase === null) {
 }
 define('DATA_DIR',      $__bubbleBase . '/rooms');
 define('PEER_TIMEOUT',  180);       // seconds without a heartbeat before a peer is considered gone
+define('PEER_TOUCH_INTERVAL', 20);  // do not rewrite the room file for every poll
 // Per-room ring buffer of message references. Attachments no longer live in the room
 // file — only a small reference per file — so this caps chat turns, not raw bytes.
 define('MAX_MSGS',      500);
-define('MAX_PAYLOAD',   1048576);   // 1 MB per message (base64 ciphertext)
+define('MAX_PAYLOAD',   262144);    // 256 KB per JSON message (base64 ciphertext)
+define('MAX_CHUNK',     1048576);   // 1 MB per raw attachment chunk
+define('MIN_CHUNK',     4096);      // prevent tiny-chunk metadata / request amplification
+define('MAX_PARTS',     16384);
 define('SWEEP_INTERVAL', 30);       // seconds between full expiry sweeps
 define('POLL_PAGE',      40);       // max messages returned per poll
 define('BLOB_TTL',       21600);    // 6h: idle attachment blobs are reclaimed
 define('MAX_BLOB',       52428800); // 50 MB hard cap per attachment
+define('MAX_ROOM_BLOB_BYTES', 1073741824); // 1 GiB of committed + in-flight blobs per room
+define('MAX_ROOM_FILES', 100);      // committed + in-flight attachments per room
+define('UPLOAD_TTL',      21600);   // abandoned uploads are reclaimed after 6h
 // Room self-compaction: keep the JSON small so every poll stays cheap and never
 // exhausts memory. See compact_room() below.
 define('COMPACT_CAP',    4 * 1048576);   // soft cap; above this we prune legacy leftovers
 define('HARD_CAP',       16 * 1048576);  // only shed legit (non-legacy) messages past this
-define('LEGACY_PAYLOAD', 64 * 1024);     // payloads above this are leftover inline blobs from
-                                          // the old base64-chunk era — unreadable today, safe to drop
+define('LEGACY_PAYLOAD', 256 * 1024);     // current clients are bounded below this; larger
+                                          // entries are leftovers from the old inline-blob era
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store, no-cache, must-revalidate');
@@ -99,9 +106,38 @@ function blob_dir(string $room): string
 
 function blob_path(string $room, string $fid): string
 {
-    // Keep hex only, so a hand-crafted fid can never walk out of the directory.
-    $safe = preg_replace('/[^a-f0-9]/i', '', $fid) ?: '';
-    return $safe === '' ? '' : blob_dir($room) . '/' . strtolower($safe) . '.bin';
+    // Require the complete identifier; silently stripping characters could make
+    // two different attacker-supplied ids address the same file.
+    if (!preg_match('/^[a-f0-9]{16,64}$/i', $fid)) {
+        return '';
+    }
+    return blob_dir($room) . '/' . strtolower($fid) . '.bin';
+}
+
+function burned_path(string $room): string
+{
+    return DATA_DIR . '/' . hash('sha256', $room) . '.burned';
+}
+
+function valid_cid(string $cid): bool
+{
+    return $cid !== '' && preg_match('/^[a-f0-9]{12,64}$/i', $cid) === 1;
+}
+
+function valid_mid(string $mid): bool
+{
+    return $mid !== '' && preg_match('/^[a-f0-9]{8,64}$/i', $mid) === 1;
+}
+
+function room_blob_bytes(array $data): int
+{
+    $total = 0;
+    foreach (['blobs', 'uploads'] as $bucket) {
+        foreach (($data[$bucket] ?? []) as $item) {
+            $total += max(0, (int) ($item['size'] ?? $item['bytes'] ?? 0));
+        }
+    }
+    return $total;
 }
 
 function purge_dir(string $dir): void
@@ -185,6 +221,22 @@ function sweep_blobs(): void
         }
         $roomFile = preg_replace('/\.files$/', '.json', (string) $dir) ?: '';
         $orphan   = $roomFile === '' || !is_file($roomFile);
+        $lfp = null;
+        if (!$orphan) {
+            $lfp = @fopen($roomFile . '.lock', 'c+');
+            if ($lfp === false || !@flock($lfp, LOCK_EX)) {
+                if (is_resource($lfp)) fclose($lfp);
+                continue;
+            }
+            // The room may have been burned between the initial is_file() check
+            // and lock acquisition. Re-evaluate before touching its attachments.
+            if (!is_file($roomFile)) {
+                @flock($lfp, LOCK_UN);
+                fclose($lfp);
+                $lfp = null;
+                $orphan = true;
+            }
+        }
         foreach (glob($dir . '/*.bin') ?: [] as $b) {
             $mtime = @filemtime($b);
             if ($orphan || $mtime === false || $now - $mtime > BLOB_TTL) {
@@ -193,6 +245,10 @@ function sweep_blobs(): void
         }
         if ($orphan) {
             @rmdir($dir);
+        }
+        if (is_resource($lfp)) {
+            @flock($lfp, LOCK_UN);
+            fclose($lfp);
         }
     }
 }
@@ -206,9 +262,10 @@ function sweep_blobs(): void
  * room with zero live peers is purged (after the grace window) instead of lingering.
  *
  * @param callable(array<string,mixed>):mixed $fn
+ * @param bool $burned Mark a deliberately destroyed room so stale requests cannot recreate it.
  * @return array{0:array<string,mixed>|null,1:mixed}
  */
-function transact(string $room, bool $create, ?string $cid, callable $fn): array
+function transact(string $room, bool $create, ?string $cid, callable $fn, bool $burned = false): array
 {
     if (!is_dir(DATA_DIR) && !@mkdir(DATA_DIR, 0700, true) && !is_dir(DATA_DIR)) {
         out(['error' => 'storage unavailable'], 500);
@@ -225,14 +282,19 @@ function transact(string $room, bool $create, ?string $cid, callable $fn): array
     }
     @flock($lfp, LOCK_EX);
 
-    if (!$create && !is_file($path)) {
-        // Room file already gone (left / burned / expired). The fopen('c+') above just
-        // re-created the orphaned .lock on disk, so drop it here — otherwise a straggler
-        // request (a late poll still in flight on tab close, or the peer's next poll right
-        // after a burn) keeps the .lock alive forever and it never gets cleaned up.
+    if ($create && is_file(burned_path($room))) {
         @flock($lfp, LOCK_UN);
         fclose($lfp);
         @unlink($lockp);
+        return [null, ['burned' => true]];
+    }
+
+    if (!$create && !is_file($path)) {
+        // Room file already gone (left / burned / expired). Keep the lock file in place:
+        // unlinking it after releasing the handle would race a simultaneous create request.
+        // It is tiny and can safely be reused by a later request.
+        @flock($lfp, LOCK_UN);
+        fclose($lfp);
         return [null, null];
     }
 
@@ -242,25 +304,45 @@ function transact(string $room, bool $create, ?string $cid, callable $fn): array
     $now = time();
     $fresh = !is_array($data) || !isset($data['created'], $data['seq'], $data['msgs']);
     if ($fresh) {
-        $data = ['created' => $now, 'seq' => 0, 'msgs' => [], 'peers' => []];
+        $data = ['created' => $now, 'seq' => 0, 'msgs' => [], 'peers' => [], 'uploads' => [], 'blobs' => []];
     } else {
         if (!is_array($data['peers'] ?? null)) {
             $data['peers'] = [];
+        }
+        if (!is_array($data['uploads'] ?? null)) {
+            $data['uploads'] = [];
+        }
+        if (!is_array($data['blobs'] ?? null)) {
+            $data['blobs'] = [];
         }
         foreach ($data['peers'] as $k => $ts) {
             if ($now - (int) $ts > PEER_TIMEOUT) {
                 unset($data['peers'][$k]);
             }
         }
+        foreach ($data['uploads'] as $fid => $upload) {
+            $updated = (int) ($upload['updated'] ?? 0);
+            if ($updated <= 0 || $now - $updated > UPLOAD_TTL || !is_file(blob_path($room, (string) $fid))) {
+                @unlink(blob_path($room, (string) $fid));
+                unset($data['uploads'][$fid]);
+            }
+        }
+        foreach ($data['blobs'] as $fid => $blob) {
+            if (!is_file(blob_path($room, (string) $fid))) {
+                unset($data['blobs'][$fid]);
+            }
+        }
     }
 
-    if ($cid !== null && $cid !== '') {
-        $data['peers'][$cid] = $now;
+    if ($cid !== null && $cid !== '' && valid_cid($cid)) {
+        $last = isset($data['peers'][$cid]) ? (int) $data['peers'][$cid] : 0;
+        if ($last === 0 || $now - $last >= PEER_TOUCH_INTERVAL) {
+            $data['peers'][$cid] = $now;
+        }
     }
 
-    if (!$fresh && count($data['peers']) === 0) {
+    if (!$fresh && count($data['peers']) === 0 && !$burned) {
         @unlink($path);
-        @unlink($path . '.lock');
         purge_dir(blob_dir($room));
         @flock($lfp, LOCK_UN);
         fclose($lfp);
@@ -275,8 +357,12 @@ function transact(string $room, bool $create, ?string $cid, callable $fn): array
     $result = $fn($data);
 
     if ($data === null) {
+        if ($burned) {
+            // Create the tombstone while the original lock is still linked. Any
+            // stale create request that acquires the lock afterwards sees it first.
+            @file_put_contents(burned_path($room), (string) time(), LOCK_EX);
+        }
         @unlink($path);
-        @unlink($path . '.lock');
         purge_dir(blob_dir($room));
         @flock($lfp, LOCK_UN);
         fclose($lfp);
@@ -295,6 +381,14 @@ function transact(string $room, bool $create, ?string $cid, callable $fn): array
         @flock($lfp, LOCK_UN);
         fclose($lfp);
         out(['error' => 'storage encode failed'], 500);
+    }
+    // A heartbeat-only poll still needs to inspect the room under the lock, but it
+    // should not rewrite identical JSON every few seconds. This is the main guard
+    // against write amplification in busy rooms.
+    if (is_string($raw) && hash_equals($raw, $json)) {
+        @flock($lfp, LOCK_UN);
+        fclose($lfp);
+        return [$data, $result];
     }
     // Atomic write: stage to a temp file, then rename() into place. On POSIX the
     // rename is atomic (readers see old or new, never half); on Windows rename() won't
@@ -329,7 +423,7 @@ function transact(string $room, bool $create, ?string $cid, callable $fn): array
  * Remove rooms that have zero live peers.
  *
  * Throttled to at most one pass per SWEEP_INTERVAL: a full sweep globs every room and
- * reads it under a shared lock, which is far too expensive on every single request
+ * reads it under the room lock, which is far too expensive on every single request
  * once a room holds tens of megabytes of file chunks. The delay only shifts room
  * reclamation by SWEEP_INTERVAL past PEER_TIMEOUT, which is harmless.
  */
@@ -353,25 +447,25 @@ function sweep_expired(): void
     $glob = glob(DATA_DIR . '/*.json');
     foreach ($glob === false ? [] : $glob as $file) {
         $lockp = $file . '.lock';
-        // SHARED lock on the same file transact() uses, so we never read mid-rename().
-        // Without it a racing write could hand us a truncated JSON.
+        // Exclusive lock on the same file transact() uses. The lock is held through
+        // the liveness check and deletion so a heartbeat cannot race the unlink.
         $lfp = @fopen($lockp, 'c+');
         if ($lfp === false) {
             continue;
         }
-        if (!@flock($lfp, LOCK_SH)) {
+        if (!@flock($lfp, LOCK_EX)) {
             fclose($lfp);
             continue;
         }
         $raw = is_file($file) ? @file_get_contents($file) : '';
-        @flock($lfp, LOCK_UN);
-        fclose($lfp);
 
         $data = ($raw === false || $raw === '') ? null : json_decode($raw, true);
         if (!is_array($data)) {
             // Unreadable snapshot (a mid-write race, or genuinely corrupt). NEVER
             // unlink on a parse failure — a concurrent writer may simply be in
             // flight. Re-evaluate on a later request.
+            @flock($lfp, LOCK_UN);
+            fclose($lfp);
             continue;
         }
         $peers = is_array($data['peers'] ?? null) ? $data['peers'] : [];
@@ -384,8 +478,12 @@ function sweep_expired(): void
         }
         if (!$alive) {
             @unlink($file);
-            @unlink($file . '.lock');
             purge_dir(preg_replace('/\.json$/', '.files', $file) ?: '');
+        }
+        @flock($lfp, LOCK_UN);
+        fclose($lfp);
+        if (!$alive) {
+            @unlink($file . '.lock');
         }
     }
 }
@@ -399,8 +497,15 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
 //   * raw binary — the action lives in the query string and the body is opaque
 //                  ciphertext bytes. That is how attachments travel now: base64-encoding
 //                  them into the room JSON is what blew up PHP's memory limit before.
-$rawBody = (string) file_get_contents('php://input');
 $action  = (string) ($_GET['a'] ?? '');
+$contentLength = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+if ($action === 'fpart' && $contentLength > MAX_CHUNK) {
+    out(['error' => 'chunk too large'], 413);
+}
+if ($action === '' && $contentLength > MAX_PAYLOAD + 8192) {
+    out(['error' => 'request too large'], 413);
+}
+$rawBody = (string) file_get_contents('php://input');
 
 if ($action === '') {
     $body = json_decode($rawBody, true);
@@ -417,17 +522,28 @@ if (!preg_match('/^[A-Za-z0-9_\-\x{4e00}-\x{9fa5}]{1,32}$/u', $room)) {
     out(['error' => 'bad room'], 400);
 }
 
+$requestCid = (string) ($body['cid'] ?? '');
+if ($requestCid !== '' && !valid_cid($requestCid)) {
+    out(['error' => 'bad cid'], 400);
+}
+
 sweep_expired();
 
 switch ($action) {
 
     case 'hello':
         $cid = (string) ($body['cid'] ?? '');
+        if (!valid_cid($cid)) {
+            out(['error' => 'bad cid'], 400);
+        }
         [$data, $info] = transact($room, true, $cid, function (array &$data): array {
             return [
                 'seq' => $data['seq'],
             ];
         });
+        if ($data === null) {
+            out(['gone' => true], 410);
+        }
         // Max single-request body = min(php post_max_size, server MAX_PAYLOAD).
         // The client shrinks its chunk below this so no block exceeds the limit.
         // If nginx client_max_body_size is stricter, ops must raise it to match.
@@ -445,11 +561,29 @@ switch ($action) {
             out(['error' => 'bad payload'], 400);
         }
         $cid = (string) ($body['cid'] ?? '');
-        [$data, $seq] = transact($room, true, $cid, function (array &$data) use ($payload): int {
+        $mid = (string) ($body['mid'] ?? '');
+        if (!valid_cid($cid) || ($mid !== '' && !valid_mid($mid))) {
+            out(['error' => 'bad message id'], 400);
+        }
+        [$data, $seq] = transact($room, true, $cid, function (array &$data) use ($payload, $mid): int {
+            if ($mid !== '') {
+                foreach ($data['msgs'] as $existing) {
+                    if (is_array($existing) && ($existing['m'] ?? '') === $mid) {
+                        return (int) ($existing['i'] ?? 0);
+                    }
+                }
+            }
             $data['seq']++;
-            $data['msgs'][] = ['i' => $data['seq'], 't' => time(), 'p' => $payload];
+            $message = ['i' => $data['seq'], 't' => time(), 'p' => $payload];
+            if ($mid !== '') {
+                $message['m'] = $mid;
+            }
+            $data['msgs'][] = $message;
             return $data['seq'];
         });
+        if ($data === null) {
+            out(['gone' => true], 410);
+        }
         out([
             'ok' => true,
             'i'  => $seq,
@@ -494,6 +628,9 @@ switch ($action) {
         // so transact() does NOT re-stamp us, then remove ourselves in the callback.
         // If nobody else remains, $data is nulled to purge the room immediately.
         $cid = (string) ($body['cid'] ?? '');
+        if (!valid_cid($cid)) {
+            out(['error' => 'bad cid'], 400);
+        }
         transact($room, false, null, function (array &$data) use ($cid): void {
             unset($data['peers'][$cid]);
             if (count($data['peers']) === 0) {
@@ -506,67 +643,219 @@ switch ($action) {
         // Wipe messages for the whole room (every online peer sees an empty room on next poll).
         // Peers are kept so the room stays alive while someone is still watching.
         $cid = (string) ($body['cid'] ?? '');
-        transact($room, false, $cid, function (array &$data): void {
+        if (!valid_cid($cid)) {
+            out(['error' => 'bad cid'], 400);
+        }
+        [$data] = transact($room, false, $cid, function (array &$data) use ($room): void {
             $data['seq']   = 0;
             $data['msgs']  = [];
+            $data['uploads'] = [];
+            $data['blobs'] = [];
+            // Hold the room lock while purging files so an in-flight fpart cannot
+            // append data after a clear operation has completed.
+            purge_dir(blob_dir($room));
         });
-        purge_dir(blob_dir($room));
+        if ($data === null) {
+            out(['gone' => true], 410);
+        }
         out(['ok' => true]);
 
     case 'fbegin':
         // Reserve a slot for an encrypted attachment: bytes stream into a standalone
         // blob, the room JSON only ever carries a tiny reference message.
         $fid  = (string) ($body['fid'] ?? '');
+        $cid  = (string) ($body['cid'] ?? '');
+        $size = (int) ($body['size'] ?? 0);
+        if (($body['probe'] ?? '') === '1') {
+            if (!valid_cid($cid)) {
+                out(['error' => 'bad cid'], 400);
+            }
+            [$data, $info] = transact($room, false, $cid, function (array &$data): array {
+                return ['chunk' => max(65536, min(php_bytes((string) ini_get('post_max_size')), MAX_CHUNK) - 8192)];
+            });
+            if ($data === null) {
+                out(['gone' => true], 410);
+            }
+            out(['ok' => true, 'chunk' => $info['chunk']]);
+        }
         $path = blob_path($room, $fid);
-        if ($path === '') {
-            out(['error' => 'bad fid'], 400);
+        if ($path === '' || !valid_cid($cid) || $size <= 0 || $size > MAX_BLOB) {
+            out(['error' => 'bad upload'], 400);
         }
-        $dir = dirname($path);
-        if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
-            out(['error' => 'storage unavailable'], 500);
+        [$data, $info] = transact($room, false, $cid, function (array &$data) use ($room, $fid, $cid, $size, $path): array {
+            if (isset($data['uploads'][$fid]) || isset($data['blobs'][$fid])) {
+                return ['error' => 'upload exists'];
+            }
+            if (count($data['uploads']) + count($data['blobs']) >= MAX_ROOM_FILES || room_blob_bytes($data) + $size > MAX_ROOM_BLOB_BYTES) {
+                return ['error' => 'room quota exceeded'];
+            }
+            $dir = dirname($path);
+            if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
+                return ['error' => 'storage unavailable'];
+            }
+            // 'wb' truncates, so retrying with the same fid starts from a clean slate.
+            $fp = @fopen($path, 'wb');
+            if ($fp === false) {
+                return ['error' => 'storage unavailable'];
+            }
+            fclose($fp);
+            $data['uploads'][$fid] = [
+                'cid' => $cid,
+                'size' => $size,
+                'bytes' => 0,
+                'next' => 0,
+                'chunk' => max(65536, min(php_bytes((string) ini_get('post_max_size')), MAX_CHUNK) - 8192),
+                'updated' => time(),
+                'parts' => [],
+            ];
+            return ['chunk' => $data['uploads'][$fid]['chunk']];
+        });
+        if ($data === null) {
+            out(['gone' => true], 410);
         }
-        // 'wb' truncates, so retrying with the same fid starts from a clean slate.
-        $fp = @fopen($path, 'wb');
-        if ($fp === false) {
-            out(['error' => 'storage unavailable'], 500);
+        if (isset($info['error'])) {
+            out(['error' => $info['error']], $info['error'] === 'room quota exceeded' ? 413 : 409);
         }
-        fclose($fp);
         out([
             'ok'    => true,
-            'chunk' => max(65536, min(php_bytes((string) ini_get('post_max_size')), MAX_PAYLOAD) - 8192),
+            'chunk' => $info['chunk'],
         ]);
 
     case 'fpart':
         // Body is raw ciphertext: append it verbatim. No base64, no JSON envelope,
         // and crucially nothing lands in the room file.
         $fid  = (string) ($body['fid'] ?? '');
+        $cid  = (string) ($body['cid'] ?? '');
+        $seq  = (int) ($body['seq'] ?? -1);
         $path = blob_path($room, $fid);
-        if ($path === '' || !is_file($path)) {
-            out(['error' => 'no slot'], 400);
+        if ($path === '' || !valid_cid($cid) || $seq < 0) {
+            out(['error' => 'bad upload'], 400);
         }
-        if (strlen($rawBody) === 0 || strlen($rawBody) > MAX_PAYLOAD) {
+        if (strlen($rawBody) === 0 || strlen($rawBody) > MAX_CHUNK) {
             out(['error' => 'bad chunk'], 400);
         }
-        if (@file_put_contents($path, $rawBody, FILE_APPEND | LOCK_EX) === false) {
-            out(['error' => 'storage write failed'], 500);
+        [$data, $info] = transact($room, false, $cid, function (array &$data) use ($fid, $cid, $seq, $rawBody, $path): array {
+            $upload = $data['uploads'][$fid] ?? null;
+            if (!is_array($upload) || ($upload['cid'] ?? '') !== $cid || !is_file($path)) {
+                return ['error' => 'no slot'];
+            }
+            $next = (int) ($upload['next'] ?? 0);
+            $bytes = (int) ($upload['bytes'] ?? 0);
+            $length = strlen($rawBody);
+            if ($length < MIN_CHUNK && $bytes + $length < (int) ($upload['size'] ?? 0)) {
+                return ['error' => 'chunk too small'];
+            }
+            if ($next >= MAX_PARTS) {
+                return ['error' => 'too many chunks'];
+            }
+            if ($seq < $next) {
+                $part = $upload['parts'][(string) $seq] ?? null;
+                $offset = is_array($part) ? (int) ($part['offset'] ?? -1) : -1;
+                $partLength = is_array($part) ? (int) ($part['length'] ?? -1) : -1;
+                if ($offset < 0 || $partLength !== $length || $offset + $partLength > $bytes) {
+                    return ['error' => 'duplicate chunk mismatch'];
+                }
+                $fp = @fopen($path, 'rb');
+                if ($fp === false || fseek($fp, $offset) !== 0) {
+                    @fclose($fp);
+                    return ['error' => 'storage read failed'];
+                }
+                $old = fread($fp, $length);
+                fclose($fp);
+                $expectedHash = is_array($part) ? (string) ($part['hash'] ?? '') : '';
+                if (!is_string($old) || $expectedHash === '' || !hash_equals($expectedHash, hash('sha256', $rawBody))) {
+                    return ['error' => 'duplicate chunk mismatch'];
+                }
+                return ['ok' => true, 'duplicate' => true];
+            }
+            if ($seq !== $next || $bytes !== (int) @filesize($path)) {
+                return ['error' => 'out of order', 'expected' => $next];
+            }
+            if ($bytes + strlen($rawBody) > (int) ($upload['size'] ?? 0) || $bytes + strlen($rawBody) > MAX_BLOB) {
+                return ['error' => 'attachment too large'];
+            }
+            if (@file_put_contents($path, $rawBody, FILE_APPEND | LOCK_EX) === false) {
+                return ['error' => 'storage write failed'];
+            }
+            $data['uploads'][$fid]['bytes'] = $bytes + strlen($rawBody);
+            $data['uploads'][$fid]['next'] = $next + 1;
+            $data['uploads'][$fid]['updated'] = time();
+            $data['uploads'][$fid]['parts'][(string) $seq] = [
+                'offset' => $bytes,
+                'length' => strlen($rawBody),
+                'hash' => hash('sha256', $rawBody),
+            ];
+            return ['ok' => true];
+        });
+        if ($data === null) {
+            out(['gone' => true], 410);
         }
-        clearstatcache(true, $path);
-        if ((int) @filesize($path) > MAX_BLOB) {
-            @unlink($path);
-            out(['error' => 'attachment too large'], 400);
+        if (($info['error'] ?? '') !== '') {
+            out($info, ($info['error'] === 'out of order' || $info['error'] === 'no slot') ? 409 : 400);
+        }
+        out(['ok' => true]);
+
+    case 'fcommit':
+        $fid = (string) ($body['fid'] ?? '');
+        $cid = (string) ($body['cid'] ?? '');
+        $path = blob_path($room, $fid);
+        if ($path === '' || !valid_cid($cid)) {
+            out(['error' => 'bad upload'], 400);
+        }
+        [$data, $info] = transact($room, false, $cid, function (array &$data) use ($fid, $cid, $path): array {
+            $upload = $data['uploads'][$fid] ?? null;
+            if (!is_array($upload) || ($upload['cid'] ?? '') !== $cid || !is_file($path)) {
+                return ['error' => 'no slot'];
+            }
+            $size = (int) ($upload['size'] ?? 0);
+            $bytes = (int) ($upload['bytes'] ?? 0);
+            if ($bytes !== $size || (int) @filesize($path) !== $size) {
+                return ['error' => 'upload incomplete'];
+            }
+            $data['blobs'][$fid] = [
+                'cid' => $cid,
+                'size' => $size,
+                'updated' => time(),
+            ];
+            unset($data['uploads'][$fid]);
+            return ['ok' => true];
+        });
+        if ($data === null) {
+            out(['gone' => true], 410);
+        }
+        if (($info['error'] ?? '') !== '') {
+            out($info, $info['error'] === 'no slot' ? 409 : 400);
         }
         out(['ok' => true]);
 
     case 'fetch':
         $fid  = (string) ($body['fid'] ?? '');
+        $cid  = (string) ($body['cid'] ?? '');
         $path = blob_path($room, $fid);
-        if ($path === '' || !is_file($path)) {
-            out(['error' => 'not found'], 404);
+        if ($path === '' || !valid_cid($cid)) {
+            out(['error' => 'bad request'], 400);
         }
-        // Refresh mtime so a blob people are still pulling is never reaped.
-        @touch($path);
+        [$data, $info] = transact($room, false, $cid, function (array &$data) use ($fid, $path, $cid): array {
+            // Older rooms predate the blob manifest. Keep their already-written
+            // attachments readable while new uploads remain manifest-controlled.
+            if (!is_file($path) || (isset($data['blobs'][$fid]) === false && isset($data['uploads'][$fid]))) {
+                return ['error' => 'not found'];
+            }
+            if (!isset($data['blobs'][$fid])) {
+                $data['blobs'][$fid] = ['cid' => '', 'size' => (int) @filesize($path), 'updated' => time()];
+            }
+            // Refresh mtime so a blob people are still pulling is never reaped.
+            @touch($path);
+            return ['ok' => true, 'size' => (int) @filesize($path)];
+        });
+        if ($data === null) {
+            out(['gone' => true], 410);
+        }
+        if (($info['error'] ?? '') !== '') {
+            out(['error' => $info['error']], 404);
+        }
         header('Content-Type: application/octet-stream');
-        header('Content-Length: ' . (string) (int) @filesize($path));
+        header('Content-Length: ' . (string) $info['size']);
         @readfile($path);
         exit;
 
@@ -577,7 +866,7 @@ switch ($action) {
         // cid=null avoids re-stamping a presence entry we're about to erase.
         transact($room, false, null, function (array &$data): void {
             $data = null; // unconditional purge regardless of who else is in the room
-        });
+        }, true);
         out(['ok' => true]);
 
     default:
