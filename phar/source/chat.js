@@ -460,8 +460,9 @@ function serializeEditor() {
         if (node.nodeType === 3) out.push(node.textContent)
         else if (node.nodeName === 'BR') out.push('\n')
         else if (node.nodeName === 'DIV') out.push('\n' + node.textContent)
-        else if (node.nodeName === 'S') {
-            const m = (node.getAttribute('style') || '').match(/emot\/(\d+)\.svg/)
+        else if (node.nodeName === 'S' || (node.nodeName === 'IMG' && node.classList.contains('emot'))) {
+            const attr = node.nodeName === 'S' ? (node.getAttribute('style') || '') : (node.getAttribute('src') || '')
+            const m = attr.match(/emot\/(\d+)\.svg/)
             if (m) out.push('[[E' + m[1] + ']]')
         }
     })
@@ -477,9 +478,11 @@ function renderText(aside, text) {
             if (!seg) continue
             const m = seg.match(/^\[\[E(\d+)\]\]$/)
             if (m) {
-                const s = document.createElement('s')
-                s.style.backgroundImage = 'url(//ui.gg/lib/emot/' + m[1] + '.svg)'
-                aside.appendChild(s)
+                const img = document.createElement('img')
+                img.className = 'emot'
+                img.src = '//ui.gg/lib/emot/' + m[1] + '.svg'
+                img.setAttribute('contenteditable', 'false')
+                aside.appendChild(img)
             } else {
                 aside.appendChild(document.createTextNode(seg))
             }
@@ -785,23 +788,91 @@ const focusEnd = el => {
     sel.addRange(range)
     el.focus()
 }
-function insertEmot(srcS) {
-    const s = document.createElement('s')
-    const st = srcS.getAttribute('style')
-    if (st) s.setAttribute('style', st)
+let savedRange = null
+const saveCaret = () => {
     const sel = window.getSelection()
-    if (sel && sel.rangeCount && chatControl.contains(sel.anchorNode)) {
-        const range = sel.getRangeAt(0)
-        range.deleteContents()
-        range.insertNode(s)
-        range.setStartAfter(s)
-        range.collapse(true)
-        sel.removeAllRanges()
-        sel.addRange(range)
-    } else {
-        chatControl.appendChild(s)
+    if (sel && sel.rangeCount > 0) {
+        const r = sel.getRangeAt(0)
+        if (chatControl && chatControl.contains(r.commonAncestorContainer)) savedRange = r.cloneRange()
     }
 }
+chatControl.addEventListener('keyup', saveCaret)
+chatControl.addEventListener('mouseup', saveCaret)
+chatControl.addEventListener('input', saveCaret)
+function insertEmot(srcImg) {
+    const img = document.createElement('img')
+    img.className = 'emot'
+    const src = srcImg.getAttribute('src')
+    if (src) img.src = src
+    img.setAttribute('contenteditable', 'false') // Firefox: keep caret outside the empty inline tag
+    if (savedRange && chatControl.contains(savedRange.commonAncestorContainer)) {
+        savedRange.collapse(true)
+        savedRange.insertNode(img)
+        savedRange.setStartAfter(img)
+        savedRange.collapse(true)
+        const sel = window.getSelection()
+        sel.removeAllRanges()
+        sel.addRange(savedRange)
+        savedRange = savedRange.cloneRange()
+    } else {
+        chatControl.appendChild(img)
+    }
+}
+let draggedEmot = null
+chatControl.addEventListener('dragstart', e => {
+    const img = e.target.closest?.('img')
+    if (img && chatControl.contains(img)) {
+        draggedEmot = img
+        e.dataTransfer.effectAllowed = 'move'
+        e.dataTransfer.setData('text/plain', '')
+    }
+})
+chatControl.addEventListener('dragover', e => {
+    if (draggedEmot) {
+        e.preventDefault()
+        e.dataTransfer.dropEffect = 'move'
+    }
+})
+chatControl.addEventListener('drop', e => {
+    if (!draggedEmot) return
+    e.preventDefault()
+    const dropped = draggedEmot
+    draggedEmot = null
+    let range = null
+    if (document.caretRangeFromPoint) {
+        range = document.caretRangeFromPoint(e.clientX, e.clientY)
+    } else if (document.caretPositionFromPoint) {
+        const p = document.caretPositionFromPoint(e.clientX, e.clientY)
+        if (p) { range = document.createRange(); range.setStart(p.offsetNode, p.offset); range.collapse(true) }
+    }
+    if (range) {
+        range.insertNode(dropped)
+        range.setStartAfter(dropped)
+        range.collapse(true)
+        const sel = window.getSelection()
+        sel.removeAllRanges()
+        sel.addRange(range)
+        savedRange = range.cloneRange()
+    } else {
+        chatControl.appendChild(dropped)
+    }
+    chatControl.focus()
+})
+chatControl.addEventListener('dragend', () => { draggedEmot = null })
+chatControl.addEventListener('click', e => {
+    const img = e.target.closest?.('img')
+    if (!img) return
+    const sel = window.getSelection()
+    if (!sel || !sel.rangeCount || sel.getRangeAt(0).collapsed) return
+    const rect = img.getBoundingClientRect()
+    const after = (e.clientX - rect.left) > rect.width / 2
+    const range = document.createRange()
+    after ? range.setStartAfter(img) : range.setStartBefore(img)
+    range.collapse(true)
+    sel.removeAllRanges()
+    sel.addRange(range)
+    savedRange = range.cloneRange()
+})
 function renderAttachments() {
     if (!attachBox) return
     attachBox.textContent = ''
@@ -820,15 +891,15 @@ function renderAttachments() {
 }
 
 document.addEventListener('click', e => {
-    const s = e.target.closest?.('s')
+    const s = e.target.closest?.('img.emot')
     if (s && s.closest('[uigg="emot"]')) {
         const tip = s.closest('chat-tip')
         tip && (tip.style.display = 'none')
         insertEmot(s)
-        focusEnd(chatControl)
+        chatControl.focus()
         return
     }
-    if (e.target.matches?.('chat aside img')) {
+    if (e.target.matches?.('chat aside img:not(.emot)')) {
         const imgSrc = e.target.getAttribute('src')
         const pop = document.createElement('pop')
         pop.className = 'anime-fade-in center'
