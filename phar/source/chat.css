@@ -66,9 +66,17 @@ chat-attachments {display: flex;flex-wrap: wrap;gap: 10px;padding: 5px 15px;
         .att-x {margin-left: 4px;color: var(--red);cursor: pointer;font-weight: bold;flex: none;}
     }
 }
-chat-control {height: 150px;position: relative;overflow: hidden;
-    aside {height: 100%;padding: 5px 70px 5px 15px;overflow: auto;-webkit-user-modify: read-write;
+chat-control {height: 130px;position: relative;overflow: hidden;display: flex;
+    aside {height: 100%;padding: 5px 5px 5px 15px;overflow: auto;-webkit-user-modify: read-write;flex: 1;
         * {-webkit-user-modify: read-only;}
     }
-    .ico-arrow-enter {margin: 10px;background-color: var(--color);color: white;border-radius: 100%;position: absolute;right: 0;bottom: 0;}
+    cite {color: white;padding: 10px;display: flex;flex-direction: column;gap: 10px;
+        a {color: white;border-radius: 100%;}
+        .ico-arrow-enter {background-color: var(--color);}
+        .ico-mic {background-color: var(--green);
+            &.record {background-color: var(--red);animation: anime-rotate 2s linear infinite;
+                &::before {content: '\e73a';}
+            }
+        }
+    }
 }

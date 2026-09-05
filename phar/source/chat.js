@@ -20,6 +20,7 @@ const enc = (s) => new TextEncoder().encode(s)
 const dec = (u8) => new TextDecoder().decode(u8)
 const MAX_FILE = 48 * 1024 * 1024  // leave room for per-chunk AES-GCM framing and metadata
 const MAX_TEXT = 96 * 1024
+const MAX_VOICE_MS = 3 * 60 * 1000  // hard cap so a stuck mic can't record forever; tune freely
 const FILE_MAGIC = new Uint8Array([0x42, 0x46, 0x31, 0x01])
 const POLL_PAGE = 40
 const POLL_IDLE = 3000
@@ -354,6 +355,17 @@ function renderBlob(aside, meta, blob) {
         audio.src = url
         audio.controls = true
         audio.addEventListener('loadeddata', scroll)
+        // Some codecs can't be decoded on this device (e.g. Safari receiving webm/opus
+        // from a Chromium sender). Never leave a broken player — fall back to a download.
+        audio.addEventListener('error', () => {
+            const a = document.createElement('a')
+            a.className = 'file-btn'
+            a.href = url
+            a.download = meta.name || 'voice'
+            a.textContent = 'Download voice message'
+            aside.textContent = ''
+            aside.appendChild(a)
+        })
         aside.appendChild(audio)
     } else if (type.startsWith('video/')) {
         const video = document.createElement('video')
@@ -577,6 +589,76 @@ async function sendFile(f) {
         aside.textContent = 'Delivery status unknown'
     }
 }
+// ===== Voice recording: record -> encrypt -> send via the existing file pipeline =====
+// The recorded blob is handed to sendFile() as a normal File, so encryption, chunked
+// upload, download and playback all reuse the attachment plumbing. Zero new server
+// actions. Playback on the receive side is the native <audio> player (renderBlob's
+// audio branch). Cross-codec edge cases (e.g. Safari receiving webm/opus) are handled
+// by a download fallback in renderBlob().
+let rec = null          // active MediaRecorder
+let recChunks = []      // encoded chunks collected during recording
+let recStream = null    // getUserMedia stream, so we can release the mic on stop
+let recTimer = null     // safety auto-stop
+let recEl = null        // the mic button element, to toggle its class
+function pickAudioMime() {
+    // Prefer the smallest universally-playable codec per browser. Chromium/Firefox
+    // record webm/opus; Safari only records mp4/AAC.
+    const cands = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4;codecs=aac', 'audio/mp4', 'audio/aac']
+    if (typeof MediaRecorder === 'undefined') return ''
+    for (const c of cands) if (MediaRecorder.isTypeSupported(c)) return c
+    return ''
+}
+async function toggleRecord() {
+    if (dead || !room) return
+    // Second click: stop recording (the 'stop' event does the send).
+    if (rec) { try { rec.stop() } catch {} return }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        Uigg.alert('This device/browser does not support audio recording')
+        return
+    }
+    const mime = pickAudioMime()
+    if (!mime) { Uigg.alert('Audio recording is not supported in this browser'); return }
+    let stream
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch {
+        Uigg.alert('Microphone permission denied')
+        return
+    }
+    recStream = stream
+    recChunks = []
+    let recorder
+    try {
+        recorder = new MediaRecorder(stream, { mimeType: mime })
+    } catch (e) {
+        stream.getTracks().forEach((t) => t.stop())
+        Uigg.alert('Failed to start recorder: ' + e.message)
+        recStream = null
+        return
+    }
+    rec = recorder
+    recEl = document.querySelector('.ico-mic')
+    recEl && recEl.classList.add('record')
+    recorder.addEventListener('dataavailable', (e) => { if (e.data && e.data.size) recChunks.push(e.data) })
+    recorder.addEventListener('stop', onRecStop)
+    recorder.start()
+    // Safety net: auto-stop at the hard cap so a forgotten tab can't record forever.
+    recTimer = setTimeout(() => { try { rec && rec.stop() } catch {} }, MAX_VOICE_MS)
+}
+async function onRecStop() {
+    clearTimeout(recTimer); recTimer = null
+    if (recStream) { recStream.getTracks().forEach((t) => t.stop()); recStream = null }
+    if (recEl) { recEl.classList.remove('record'); recEl = null }
+    const mime = (rec && rec.mimeType) || 'audio/webm'
+    const ext = (mime.includes('mp4') || mime.includes('aac')) ? 'mp4' : 'webm'
+    const blob = new Blob(recChunks, { type: mime })
+    recChunks = []
+    rec = null
+    if (!blob.size) return
+    const name = 'voice-' + Date.now() + '.' + ext
+    sfx.send()
+    await sendFile(new File([blob], name, { type: mime }))
+}
 function sessionDestroyed(title, body) {
     dead = true
     sfx.end()
@@ -694,6 +776,9 @@ async function handleHashChange() {
 handleHashChange()
 window.addEventListener('hashchange', handleHashChange)
 sendBtn.addEventListener('click', () => send())
+// Voice memo: tap to record (button turns red + spins), tap again to stop & send.
+const micBtn = document.querySelector('.ico-mic')
+if (micBtn) micBtn.addEventListener('click', () => toggleRecord())
 chatControl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.ctrlKey) { e.preventDefault(); send() }
     if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); document.execCommand('insertLineBreak') }
